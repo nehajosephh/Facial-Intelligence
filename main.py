@@ -3,23 +3,40 @@ import torch
 import torch.nn as nn
 import torch.optim as optim
 import torchvision.transforms as transforms
-from torchvision import datasets
-from torch.utils.data import Dataset, DataLoader
-import matplotlib.pyplot as plt
-import itertools
+from torchvision import models
+from torch.utils.data import Dataset, DataLoader, random_split
 from PIL import Image
+import time
+import sys
+import multiprocessing
 
 # =====================
-# 🔹 Step 1: Set Dataset Paths and Custom Dataset
+# 🔹 Step 1: Set Dataset Path and Custom Dataset
 # =====================
-FER_PATH = "FER2013"
 UTKFACE_PATH = "UTKFace"
+
+def check_gpu_memory():
+    if torch.cuda.is_available():
+        gpu_memory = torch.cuda.get_device_properties(0).total_memory / 1024**3  # Convert to GB
+        print(f"Available GPU memory: {gpu_memory:.2f} GB")
+        return gpu_memory
+    return 0
+
+def adjust_batch_size(gpu_memory):
+    if gpu_memory < 4:  # Less than 4GB GPU memory
+        return 16
+    elif gpu_memory < 8:  # Less than 8GB GPU memory
+        return 32
+    return 64  # Default for larger GPUs
 
 class UTKFaceDataset(Dataset):
     def __init__(self, root_dir, transform=None):
         self.root_dir = root_dir
         self.transform = transform
         self.images = [f for f in os.listdir(root_dir) if f.endswith(('.jpg', '.png', '.jpeg'))]
+        
+        if len(self.images) == 0:
+            raise ValueError(f"No images found in {root_dir}")
         
     def __len__(self):
         return len(self.images)
@@ -31,204 +48,258 @@ class UTKFaceDataset(Dataset):
         try:
             age = float(img_name.split('_')[0])
         except:
+            print(f"Warning: Could not parse age from filename: {img_name}")
             age = 0.0
             
-        image = Image.open(img_path).convert('RGB')
+        try:
+            image = Image.open(img_path).convert('RGB')
+        except Exception as e:
+            print(f"Error loading image {img_path}: {str(e)}")
+            # Return a blank image as fallback
+            image = Image.new('RGB', (224, 224))
+            
         if self.transform:
             image = self.transform(image)
             
         return image, torch.tensor(age, dtype=torch.float32)
 
-# Check if datasets exist
-if not os.path.exists(FER_PATH) or not os.path.exists(UTKFACE_PATH):
-    raise FileNotFoundError("Datasets not found in the directory!")
+def main():
+    # Check if dataset exists and create if needed
+    if not os.path.exists(UTKFACE_PATH):
+        print(f"Error: Dataset not found at {UTKFACE_PATH}")
+        print("Please download the UTKFace dataset and place it in the current directory")
+        print("You can download it from: https://susanqq.github.io/UTKFace/")
+        sys.exit(1)
 
-# =====================
-# 🔹 Step 2: Define Image Transformations
-# =====================
-transform = transforms.Compose([
-    transforms.Resize((48, 48)),
-    transforms.Grayscale(num_output_channels=3),
-    transforms.ToTensor(),
-    transforms.Normalize(mean=[0.5, 0.5, 0.5], std=[0.5, 0.5, 0.5]),
-    transforms.Lambda(lambda x: x.to(torch.float32))
-])
+    # =====================
+    # 🔹 Step 2: Define Image Transformations
+    # =====================
+    train_transform = transforms.Compose([
+        transforms.Resize((224, 224)),
+        transforms.RandomHorizontalFlip(),
+        transforms.RandomRotation(10),
+        transforms.ColorJitter(brightness=0.2, contrast=0.2),
+        transforms.ToTensor(),
+        transforms.Normalize(mean=[0.485, 0.456, 0.406], std=[0.229, 0.224, 0.225])
+    ])
 
-# =====================
-# 🔹 Step 3: Load Datasets
-# =====================
-try:
-    fer_dataset = datasets.ImageFolder(root=FER_PATH, transform=transform)
-    utk_dataset = UTKFaceDataset(root_dir=UTKFACE_PATH, transform=transform)
-    
-    batch_size = 32
-    fer_loader = DataLoader(fer_dataset, batch_size=batch_size, shuffle=True)
-    utk_loader = DataLoader(utk_dataset, batch_size=batch_size, shuffle=True)
-    
-    print(f"FER2013 Classes: {fer_dataset.classes}")
-    print(f"Datasets loaded - FER: {len(fer_dataset)}, UTK: {len(utk_dataset)} images")
-except Exception as e:
-    print(f"Error loading datasets: {str(e)}")
-    raise
+    val_transform = transforms.Compose([
+        transforms.Resize((224, 224)),
+        transforms.ToTensor(),
+        transforms.Normalize(mean=[0.485, 0.456, 0.406], std=[0.229, 0.224, 0.225])
+    ])
 
-# =====================
-# 🔹 Step 4: Define CNN Model
-# =====================
-class MultiTaskCNN(nn.Module):
-    def __init__(self, num_sentiments, num_stances):
-        super(MultiTaskCNN, self).__init__()
+    # =====================
+    # 🔹 Step 3: Load and Split Dataset
+    # =====================
+    try:
+        # Check GPU memory and adjust batch size
+        gpu_memory = check_gpu_memory()
+        batch_size = adjust_batch_size(gpu_memory)
+        num_workers = 0  # Set to 0 for Windows to avoid multiprocessing issues
         
-        self.conv_layers = nn.Sequential(
-            nn.Conv2d(3, 32, kernel_size=3, stride=1, padding=1),
+        print(f"Using batch size: {batch_size}, workers: {num_workers}")
+        
+        # Load full dataset
+        full_dataset = UTKFaceDataset(root_dir=UTKFACE_PATH, transform=train_transform)
+        
+        # Split into train and validation sets
+        train_size = int(0.8 * len(full_dataset))
+        val_size = len(full_dataset) - train_size
+        train_dataset, val_dataset = random_split(full_dataset, [train_size, val_size])
+        
+        # Apply validation transform to validation set
+        val_dataset.dataset.transform = val_transform
+        
+        train_loader = DataLoader(train_dataset, batch_size=batch_size, shuffle=True, num_workers=num_workers)
+        val_loader = DataLoader(val_dataset, batch_size=batch_size, shuffle=False, num_workers=num_workers)
+        
+        print(f"Dataset loaded - Train: {len(train_dataset)}, Val: {len(val_dataset)} images")
+    except Exception as e:
+        print(f"Error loading dataset: {str(e)}")
+        sys.exit(1)
+
+    # =====================
+    # 🔹 Step 4: Load Pre-trained Model
+    # =====================
+    def create_model():
+        try:
+            # Load pre-trained ResNet18
+            model = models.resnet18(weights=models.ResNet18_Weights.DEFAULT)
+        except Exception as e:
+            print(f"Warning: Could not load pre-trained model: {str(e)}")
+            print("Using untrained model instead")
+            model = models.resnet18(weights=None)
+        
+        # Freeze all layers except the last few
+        for param in model.parameters():
+            param.requires_grad = False
+        
+        # Unfreeze the last few layers
+        for param in model.layer4.parameters():
+            param.requires_grad = True
+        
+        # Modify the final layer for age prediction
+        num_features = model.fc.in_features
+        model.fc = nn.Sequential(
+            nn.Linear(num_features, 256),
             nn.ReLU(),
-            nn.BatchNorm2d(32),
-            nn.MaxPool2d(kernel_size=2, stride=2),
-            nn.Conv2d(32, 64, kernel_size=3, stride=1, padding=1),
-            nn.ReLU(),
-            nn.BatchNorm2d(64),
-            nn.MaxPool2d(kernel_size=2, stride=2),
-            nn.Conv2d(64, 128, kernel_size=3, stride=1, padding=1),
-            nn.ReLU(),
-            nn.BatchNorm2d(128),
-            nn.MaxPool2d(kernel_size=2, stride=2)
+            nn.Dropout(0.3),
+            nn.Linear(256, 1)
         )
         
-        self.flatten = nn.Flatten()
-        self.dropout = nn.Dropout(0.5)
-        self.fc1 = nn.Linear(128 * 6 * 6, 512)
-        self.relu = nn.ReLU()
-        
-        self.sentiment_out = nn.Linear(512, num_sentiments)
-        self.stance_out = nn.Linear(512, num_stances)
-        self.age_out = nn.Linear(512, 1)
+        return model
 
-    def forward(self, x):
-        x = self.conv_layers(x)
-        x = self.flatten(x)
-        x = self.dropout(x)
-        x = self.fc1(x)
-        x = self.relu(x)
-        
-        sentiment_pred = self.sentiment_out(x)
-        stance_pred = self.stance_out(x)
-        age_pred = self.age_out(x)
-
-        return sentiment_pred, stance_pred, age_pred
-
-# =====================
-# 🔹 Step 5: Setup Model, Loss, and Optimizer
-# =====================
-device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-num_sentiments = len(fer_dataset.classes)
-num_stances = 3
-
-model = MultiTaskCNN(num_sentiments, num_stances).to(device)
-model = model.to(torch.float32)
-
-criterion_sentiment = nn.CrossEntropyLoss()
-criterion_stance = nn.CrossEntropyLoss()
-criterion_age = nn.MSELoss()
-optimizer = optim.Adam(model.parameters(), lr=0.001, weight_decay=1e-4)
-
-# Print model parameter types
-print(f"Model Parameters Data Type: {next(model.parameters()).dtype}")
-
-# =====================
-# 🔹 Step 6: Training Loop
-# =====================
-num_epochs = 5
-print(f"Training on {device}")
-
-for epoch in range(num_epochs):
-    model.train()
-    running_loss = 0.0
-    
-    # Create iterator for UTK dataset
-    utk_iterator = iter(utk_loader)
-    
-    for i, (images_fer, labels_fer) in enumerate(fer_loader):
-        # Get UTK batch with proper error handling
-        try:
-            images_utk, ages_utk = next(utk_iterator)
-        except StopIteration:
-            utk_iterator = iter(utk_loader)
-            images_utk, ages_utk = next(utk_iterator)
-
-        # Ensure batch sizes match
-        if images_fer.size(0) != images_utk.size(0):
-            continue
-            
-        # Move to device and set data types
-        images_fer = images_fer.to(device, dtype=torch.float32)
-        labels_fer = labels_fer.to(device)
-        images_utk = images_utk.to(device, dtype=torch.float32)
-        ages_utk = ages_utk.to(device, dtype=torch.float32)
-
-        optimizer.zero_grad()
-        
-        # Forward pass
-        sentiment_pred, stance_pred, age_pred = model(images_fer)
-        
-        # Compute losses ensuring tensor sizes match
-        loss_sentiment = criterion_sentiment(sentiment_pred, labels_fer)
-        loss_stance = criterion_stance(stance_pred, labels_fer % 3)
-        loss_age = criterion_age(age_pred.squeeze(), ages_utk[:age_pred.size(0)])
-
-        total_loss = loss_sentiment + loss_stance + loss_age
-        total_loss.backward()
-        optimizer.step()
-        
-        running_loss += total_loss.item()
-        
-        if (i + 1) % 100 == 0:
-            print(f"Epoch [{epoch+1}/{num_epochs}], Step [{i+1}/{len(fer_loader)}], Loss: {total_loss.item():.4f}")
-    
-    epoch_loss = running_loss / len(fer_loader)
-    print(f"Epoch [{epoch+1}/{num_epochs}] Complete, Avg Loss: {epoch_loss:.4f}")
-# =====================
-# 🔹 Step 7: Inference Function
-# =====================
-def predict(image_path):
-    model.eval()
-    
+    # =====================
+    # 🔹 Step 5: Setup Model, Loss, and Optimizer
+    # =====================
     try:
-        image = Image.open(image_path).convert('RGB')
-        image = transform(image).unsqueeze(0).to(device, dtype=torch.float32)
-
-        with torch.no_grad():
-            sentiment_pred, stance_pred, age_pred = model(image)
-
-        sentiment_label = torch.argmax(sentiment_pred, dim=1).item()
-        stance_label = torch.argmax(stance_pred, dim=1).item()
-        age_value = age_pred.item()
-
-        sentiment_map = fer_dataset.classes
-        stance_map = ["Support", "Neutral", "Oppose"]
-
-        print(f"Predicted Sentiment: {sentiment_map[sentiment_label]}")
-        print(f"Predicted Stance: {stance_map[stance_label]}")
-        print(f"Predicted Age: {int(age_value)}")
+        device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+        print(f"Using device: {device}")
         
+        model = create_model().to(device)
+        criterion = nn.MSELoss()
+        optimizer = optim.Adam(model.parameters(), lr=0.001)
+        scheduler = optim.lr_scheduler.ReduceLROnPlateau(optimizer, mode='min', factor=0.5, patience=2)
     except Exception as e:
-        print(f"Error processing image: {str(e)}")
-        raise
+        print(f"Error setting up model: {str(e)}")
+        sys.exit(1)
 
-# =====================
-# 🔹 Step 8: Save Model and Run Inference
-# =====================
-if __name__ == "__main__":
+    # =====================
+    # 🔹 Step 6: Training Loop with Validation
+    # =====================
+    num_epochs = 10
+    best_val_loss = float('inf')
+    patience = 5
+    patience_counter = 0
+
     try:
-        # Save the trained model
-        torch.save(model.state_dict(), "multitask_model.pth")
-        print("Model saved successfully")
+        for epoch in range(num_epochs):
+            # Training phase
+            model.train()
+            train_loss = 0.0
+            start_time = time.time()
+            
+            for i, (images, ages) in enumerate(train_loader):
+                try:
+                    images = images.to(device)
+                    ages = ages.to(device)
+
+                    optimizer.zero_grad()
+                    
+                    age_pred = model(images)
+                    loss = criterion(age_pred.squeeze(), ages)
+                    
+                    loss.backward()
+                    optimizer.step()
+                    
+                    train_loss += loss.item()
+                    
+                    if (i + 1) % 50 == 0:
+                        print(f"Epoch [{epoch+1}/{num_epochs}], Step [{i+1}/{len(train_loader)}], Loss: {loss.item():.4f}")
+                except RuntimeError as e:
+                    if "out of memory" in str(e):
+                        print("WARNING: out of memory")
+                        if torch.cuda.is_available():
+                            torch.cuda.empty_cache()
+                        continue
+                    else:
+                        raise e
+            
+            # Validation phase
+            model.eval()
+            val_loss = 0.0
+            with torch.no_grad():
+                for images, ages in val_loader:
+                    try:
+                        images = images.to(device)
+                        ages = ages.to(device)
+                        
+                        age_pred = model(images)
+                        loss = criterion(age_pred.squeeze(), ages)
+                        val_loss += loss.item()
+                    except RuntimeError as e:
+                        if "out of memory" in str(e):
+                            print("WARNING: out of memory during validation")
+                            if torch.cuda.is_available():
+                                torch.cuda.empty_cache()
+                            continue
+                        else:
+                            raise e
+            
+            # Calculate average losses
+            train_loss = train_loss / len(train_loader)
+            val_loss = val_loss / len(val_loader)
+            
+            # Learning rate scheduling
+            scheduler.step(val_loss)
+            
+            # Early stopping check
+            if val_loss < best_val_loss:
+                best_val_loss = val_loss
+                patience_counter = 0
+                # Save best model
+                try:
+                    torch.save(model.state_dict(), "best_age_model.pth")
+                except Exception as e:
+                    print(f"Warning: Could not save model: {str(e)}")
+            else:
+                patience_counter += 1
+            
+            # Print epoch statistics
+            epoch_time = time.time() - start_time
+            print(f"Epoch [{epoch+1}/{num_epochs}] Complete")
+            print(f"Time: {epoch_time:.2f}s")
+            print(f"Train Loss: {train_loss:.4f}, Val Loss: {val_loss:.4f}")
+            
+            # Early stopping
+            if patience_counter >= patience:
+                print(f"Early stopping triggered after {epoch+1} epochs")
+                break
+                
+    except Exception as e:
+        print(f"Error during training: {str(e)}")
+        sys.exit(1)
+
+    # =====================
+    # 🔹 Step 7: Inference Function
+    # =====================
+    def predict_age(image_path):
+        model.eval()
         
+        try:
+            if not os.path.exists(image_path):
+                print(f"Error: Image not found at {image_path}")
+                return
+                
+            image = Image.open(image_path).convert('RGB')
+            image = val_transform(image).unsqueeze(0).to(device)
+
+            with torch.no_grad():
+                age_pred = model(image)
+
+            age_value = age_pred.item()
+            print(f"Predicted Age: {int(age_value)}")
+            
+        except Exception as e:
+            print(f"Error processing image: {str(e)}")
+            raise
+
+    # =====================
+    # 🔹 Step 8: Run Inference
+    # =====================
+    try:
         # Run inference on a sample image
-        sample_image_path = os.path.join(FER_PATH, "happy", "PrivateTest_95094.jpg")
+        sample_image_path = os.path.join(UTKFACE_PATH, "8_1_0_20170109201705598.jpg.chip.jpg")
         if os.path.exists(sample_image_path):
-            predict(sample_image_path)
+            predict_age(sample_image_path)
         else:
             print(f"Sample image not found at: {sample_image_path}")
             
     except Exception as e:
         print(f"Error in main execution: {str(e)}")
-        raise
+        sys.exit(1)
+
+if __name__ == "__main__":
+    multiprocessing.freeze_support()
+    main()
